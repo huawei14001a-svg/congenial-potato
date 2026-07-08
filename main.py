@@ -1,157 +1,224 @@
-"""
-Генерация картинки перевода SCAM.
-
-Сверху — крупная сумма (например «0,048»).
-Снизу — строка «#SCAM отправил(а) {сумма} SCAM для {получатель}».
-
-Возвращает PNG в виде bytes, чтобы сразу отправить в Telegram.
-"""
-
+# SCAM Tip Bot — телеграм-бот для перевода внутренних токенов SCAM.
+#
+# Как пользоваться:
+#   Ответьте (reply) на сообщение пользователя и напишите:  пер 0,048
+#   Бот переведёт 0,048 SCAM автору того сообщения и пришлёт картинку:
+#     сверху крупно — 0,048
+#     снизу — «#SCAM отправил(а) 0,048 SCAM для @user»
+#
+# Команды:
+#   /start   — приветствие и справка
+#   /balance — ваш баланс SCAM
+#   /top     — топ держателей SCAM
+#   /give    — (только админ) начислить SCAM: reply + «/give 100»
+#
+# ВАЖНО: SCAM здесь — это внутренние очки, которые бот хранит в своей базе.
+# Это НЕ криптовалюта в блокчейне и реальные монеты никуда не уходят.
+import asyncio
+import logging
 import os
-from io import BytesIO
+import re
+from decimal import Decimal, InvalidOperation
 
-from PIL import Image, ImageDraw, ImageFont
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.types import BufferedInputFile, Message
 
-# --- Пути к шрифтам (лежат рядом, в assets/) ---------------------------------
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FONT_BOLD_PATH = os.path.join(BASE_DIR, "assets", "DejaVuSans-Bold.ttf")
-FONT_REGULAR_PATH = os.path.join(BASE_DIR, "assets", "DejaVuSans.ttf")
+import db
+from image_gen import render_transfer_image
 
-# Системные запасные пути на случай, если assets/ не поедет
-_FALLBACKS = [
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-]
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+log = logging.getLogger("scam-bot")
 
-# --- Цвета -------------------------------------------------------------------
-BG_TOP = (13, 17, 23)        # тёмный верх
-BG_BOTTOM = (22, 27, 34)     # чуть светлее низ
-ACCENT = (35, 197, 98)       # «денежный» зелёный
-AMOUNT_COLOR = (255, 255, 255)
-SUB_COLOR = (139, 148, 158)
-HASH_COLOR = (35, 197, 98)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("Не задан BOT_TOKEN (переменная окружения).")
 
-WIDTH = 900
-HEIGHT = 500
-PADDING = 60
+# id админов через запятую, напр. ADMIN_IDS="12345,67890"
+ADMIN_IDS = {
+    int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x
+}
 
+# Триггер перевода: «пер 0,048», «пер 12», «пер 3.5». Регистр не важен.
+TRANSFER_RE = re.compile(r"^\s*пер\s+(\d+(?:[.,]\d+)?)\s*$", re.IGNORECASE)
 
-def _load_font(bold: bool, size: int) -> ImageFont.FreeTypeFont:
-    primary = FONT_BOLD_PATH if bold else FONT_REGULAR_PATH
-    for path in (primary, *_FALLBACKS):
-        try:
-            return ImageFont.truetype(path, size)
-        except OSError:
-            continue
-    # крайний случай — встроенный растровый шрифт (без масштабирования)
-    return ImageFont.load_default()
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
 
 
-def _fit_font(draw, text, max_width, bold, start_size, min_size=14):
-    """Подбирает максимальный размер шрифта, при котором текст влезает по ширине."""
-    size = start_size
-    while size > min_size:
-        font = _load_font(bold, size)
-        w = draw.textlength(text, font=font)
-        if w <= max_width:
-            return font
-        size -= 2
-    return _load_font(bold, min_size)
+def _user_dict(u) -> dict:
+    return {"id": u.id, "username": u.username, "first_name": u.first_name}
 
 
-def _gradient_fast(width, height, top, bottom):
-    """Быстрый градиент через одну колонку + resize (без попиксельного цикла)."""
-    col = Image.new("RGB", (1, height))
-    top_r, top_g, top_b = top
-    bot_r, bot_g, bot_b = bottom
-    for y in range(height):
-        t = y / max(height - 1, 1)
-        col.putpixel(
-            (0, y),
-            (
-                int(top_r + (bot_r - top_r) * t),
-                int(top_g + (bot_g - top_g) * t),
-                int(top_b + (bot_b - top_b) * t),
-            ),
+def _display_name(u) -> str:
+    """Как показать пользователя: @username, иначе имя."""
+    if getattr(u, "username", None):
+        return f"@{u.username}"
+    return (getattr(u, "first_name", None) or "пользователь")
+
+
+def _parse_amount(raw: str) -> Decimal:
+    """'0,048' -> Decimal('0.048')."""
+    return Decimal(raw.replace(",", "."))
+
+
+@dp.message(CommandStart())
+async def cmd_start(message: Message) -> None:
+    await message.answer(
+        "👋 <b>SCAM Tip Bot</b>\n\n"
+        "Чтобы перевести SCAM — <b>ответьте</b> на сообщение человека и напишите:\n"
+        "<code>пер 0,048</code>\n\n"
+        "Я переведу ему токены и пришлю красивую картинку 🖼️\n\n"
+        "Команды:\n"
+        "• /balance — ваш баланс\n"
+        "• /top — топ держателей\n\n"
+        "<i>SCAM — внутренние очки бота, не криптовалюта.</i>"
+    )
+
+
+@dp.message(Command("balance"))
+async def cmd_balance(message: Message) -> None:
+    u = message.from_user
+    bal = await db.get_balance(u.id, u.username, u.first_name)
+    await message.answer(f"💰 Ваш баланс: <b>{_fmt(bal)}</b> SCAM")
+
+
+@dp.message(Command("top"))
+async def cmd_top(message: Message) -> None:
+    users = await db.get_top(10)
+    if not users:
+        await message.answer("Пока пусто 🤷")
+        return
+    lines = ["🏆 <b>Топ держателей SCAM</b>\n"]
+    medals = ["🥇", "🥈", "🥉"]
+    for i, u in enumerate(users):
+        name = f"@{u.username}" if u.username else (u.first_name or f"id{u.id}")
+        prefix = medals[i] if i < 3 else f"{i + 1}."
+        lines.append(f"{prefix} {name} — {_fmt(u.balance)} SCAM")
+    await message.answer("\n".join(lines))
+
+
+@dp.message(Command("give"))
+async def cmd_give(message: Message) -> None:
+    """Админская выдача: reply на пользователя + «/give 100»."""
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ Команда только для администраторов.")
+        return
+    if not message.reply_to_message:
+        await message.answer("Ответьте на сообщение пользователя, которому начислить.")
+        return
+    parts = (message.text or "").split()
+    if len(parts) < 2:
+        await message.answer("Формат: <code>/give 100</code> в ответ на сообщение.")
+        return
+    try:
+        amount = _parse_amount(parts[1])
+    except (InvalidOperation, ValueError):
+        await message.answer("Не понял сумму. Пример: <code>/give 100</code>")
+        return
+
+    target = message.reply_to_message.from_user
+    # начисляем «из воздуха»: переводим сами себе-администратору не нужно —
+    # просто увеличим баланс через транзакцию give
+    from decimal import Decimal as D  # локальный импорт для наглядности
+
+    async with db.Session() as session:
+        async with session.begin():
+            user = await db.get_or_create_user(
+                session, target.id, target.username, target.first_name
+            )
+            user.balance = user.balance + amount
+            new_bal = user.balance
+    await message.answer(
+        f"✅ Начислено {_fmt(amount)} SCAM для {_display_name(target)}. "
+        f"Баланс: {_fmt(new_bal)} SCAM."
+    )
+
+
+@dp.message(F.text.regexp(TRANSFER_RE.pattern))
+async def handle_transfer(message: Message) -> None:
+    match = TRANSFER_RE.match(message.text or "")
+    if not match:
+        return
+
+    # Должен быть reply на чьё-то сообщение
+    if not message.reply_to_message:
+        await message.reply(
+            "Чтобы перевести SCAM, <b>ответьте</b> на сообщение получателя "
+            "и напишите <code>пер 0,048</code>."
         )
-    return col.resize((width, height))
+        return
 
+    sender = message.from_user
+    recipient = message.reply_to_message.from_user
 
-def render_transfer_image(amount_str: str, recipient: str) -> bytes:
-    """
-    amount_str : сумма как строка ("0,048") — показывается 1-в-1.
-    recipient  : кому перевели ("@user" или имя).
-    """
-    img = _gradient_fast(WIDTH, HEIGHT, BG_TOP, BG_BOTTOM)
-    draw = ImageDraw.Draw(img)
+    if recipient.is_bot:
+        await message.reply("🤖 Ботам SCAM не переводим.")
+        return
 
-    # Рамка-акцент
-    draw.rounded_rectangle(
-        [(18, 18), (WIDTH - 18, HEIGHT - 18)],
-        radius=28,
-        outline=ACCENT,
-        width=3,
+    raw_amount = match.group(1)
+    try:
+        amount = _parse_amount(raw_amount)
+    except (InvalidOperation, ValueError):
+        await message.reply("Не понял сумму. Пример: <code>пер 0,048</code>")
+        return
+
+    try:
+        sender_bal, _ = await db.do_transfer(
+            _user_dict(sender), _user_dict(recipient), amount
+        )
+    except db.TransferError as e:
+        await message.reply(f"❌ {e}")
+        return
+    except Exception:  # noqa: BLE001
+        log.exception("Ошибка перевода")
+        await message.reply("⚠️ Что-то пошло не так при переводе. Попробуйте позже.")
+        return
+
+    # Картинка: сумма показывается ровно как ввёл пользователь (с запятой)
+    amount_display = raw_amount if "," in raw_amount else raw_amount.replace(".", ",")
+    recipient_name = _display_name(recipient)
+
+    try:
+        png = render_transfer_image(amount_display, recipient_name)
+    except Exception:  # noqa: BLE001
+        log.exception("Ошибка генерации картинки")
+        png = None
+
+    caption = (
+        f"#SCAM отправил(а) <b>{amount_display}</b> SCAM для {recipient_name}\n"
+        f"💼 Ваш баланс: {_fmt(sender_bal)} SCAM"
     )
 
-    # --- Крупная сумма (сверху по центру) ---
-    amount_font = _fit_font(
-        draw, amount_str, WIDTH - 2 * PADDING, bold=True, start_size=200
-    )
-    a_w = draw.textlength(amount_str, font=amount_font)
-    a_bbox = amount_font.getbbox(amount_str)
-    a_h = a_bbox[3] - a_bbox[1]
-    a_x = (WIDTH - a_w) / 2
-    a_y = HEIGHT * 0.30 - a_h / 2 - a_bbox[1]
+    if png:
+        await message.reply_photo(
+            BufferedInputFile(png, filename="scam.png"),
+            caption=caption,
+        )
+    else:
+        await message.reply(caption)
 
-    # лёгкая «тень»
-    draw.text((a_x + 4, a_y + 4), amount_str, font=amount_font, fill=(0, 0, 0))
-    draw.text((a_x, a_y), amount_str, font=amount_font, fill=AMOUNT_COLOR)
 
-    # значок SCAM под суммой
-    tag_font = _load_font(True, 34)
-    tag = "SCAM"
-    t_w = draw.textlength(tag, font=tag_font)
-    draw.text(
-        ((WIDTH - t_w) / 2, HEIGHT * 0.30 + a_h / 2 + 6),
-        tag,
-        font=tag_font,
-        fill=ACCENT,
-    )
+def _fmt(value: Decimal) -> str:
+    """Красивый вывод числа: убираем лишние нули, запятая как разделитель."""
+    s = format(value.normalize(), "f")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s.replace(".", ",")
 
-    # --- Разделитель ---
-    line_y = HEIGHT * 0.66
-    draw.line(
-        [(PADDING, line_y), (WIDTH - PADDING, line_y)],
-        fill=(48, 54, 61),
-        width=2,
-    )
 
-    # --- Нижняя строка: #SCAM отправил(а) {сумма} SCAM для {получатель} ---
-    sub_text = f"#SCAM отправил(а) {amount_str} SCAM для {recipient}"
-    sub_font = _fit_font(
-        draw, sub_text, WIDTH - 2 * PADDING, bold=False, start_size=40
-    )
-    s_w = draw.textlength(sub_text, font=sub_font)
-    s_bbox = sub_font.getbbox(sub_text)
-    s_h = s_bbox[3] - s_bbox[1]
-    s_x = (WIDTH - s_w) / 2
-    s_y = line_y + (HEIGHT - 18 - line_y) / 2 - s_h / 2 - s_bbox[1]
-
-    # Раскрасим «#SCAM» акцентом, остальное — приглушённым
-    prefix = "#SCAM "
-    rest = sub_text[len(prefix):]
-    p_w = draw.textlength(prefix, font=sub_font)
-    draw.text((s_x, s_y), prefix, font=sub_font, fill=HASH_COLOR)
-    draw.text((s_x + p_w, s_y), rest, font=sub_font, fill=SUB_COLOR)
-
-    buf = BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
+async def main() -> None:
+    await db.init_db()
+    log.info("База готова. Запускаю polling…")
+    # На всякий случай убираем вебхук, если был
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    # Быстрый локальный тест
-    data = render_transfer_image("0,048", "@durov")
-    with open("preview.png", "wb") as f:
-        f.write(data)
-    print("preview.png сохранён:", len(data), "байт")
+    asyncio.run(main())
